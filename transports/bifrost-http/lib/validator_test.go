@@ -57,6 +57,33 @@ func TestValidateConfigSchema_ValidConfig(t *testing.T) {
 	}
 }
 
+func TestValidateConfigSchema_AgentOAuthRejectsUnknownFields(t *testing.T) {
+	validConfig := `{
+		"agents": [{
+			"name": "oauth-agent",
+			"agent_card_url": "https://agent.example/.well-known/agent-card.json",
+			"runtime_auth": {
+				"type": "oauth",
+				"oauth": {
+					"token_url": "https://auth.example/token",
+					"client_id": "client-id",
+					"client_secret": "client-secret",
+					"scopes": ["agent.invoke"],
+					"audience": "https://agent.example"
+				}
+			}
+		}]
+	}`
+	if err := ValidateConfigSchema([]byte(validConfig), loadLocalSchema(t)); err != nil {
+		t.Fatalf("expected documented Agent OAuth fields to pass validation: %v", err)
+	}
+
+	invalidConfig := strings.Replace(validConfig, `"client_secret": "client-secret"`, `"client_secert": "client-secret"`, 1)
+	if err := ValidateConfigSchema([]byte(invalidConfig), loadLocalSchema(t)); err == nil {
+		t.Fatal("expected an unknown Agent OAuth field to fail validation")
+	}
+}
+
 func TestValidateConfigSchema_EmptyObject(t *testing.T) {
 	// Empty object should be valid (all properties are optional)
 	emptyConfig := `{}`
