@@ -41,6 +41,56 @@ type Scope struct {
 	// Unrestricted reports that no row-level query scope applies to the caller,
 	// so everything they may see is the whole deployment.
 	Unrestricted bool
+	// Visibility says, in a few words, which slice a restricted caller may see
+	// ("their teams' traffic"). Empty when the caller is unrestricted or the
+	// deployment has no resolver to say.
+	Visibility string
+}
+
+// CallerRestriction is what the deployment's row-level access control says
+// about one caller.
+type CallerRestriction struct {
+	// Restricted reports that the store will narrow this caller's reads.
+	Restricted bool
+	// Visibility is a short phrase for what the caller may see, written to
+	// follow "the person asking may see ...". Optional.
+	Visibility string
+}
+
+// CallerRestrictionResolver reports whether row-level access control narrows
+// the caller's reads.
+//
+// It exists because ScopeFromContext can only see a queryscope that is already
+// on the context, and a deployment whose store wrapper attaches the scope per
+// read - the enterprise one does - never puts it there. Warp then took every
+// caller for unrestricted: a team-scoped user's total was their team's rows,
+// correctly filtered by the store, and described as the whole deployment's.
+//
+// Like the scope itself this is precision, not access control. The resolver is
+// given the snapshotted context the tools run under, so it answers from the
+// same identity the store will.
+type CallerRestrictionResolver func(ctx context.Context) CallerRestriction
+
+// withCallerRestriction folds a resolver's answer into a context-derived scope.
+//
+// It only ever narrows: a caller the context already shows as restricted stays
+// restricted whatever the resolver says, so a resolver that knows nothing
+// cannot widen a default. The local admin is left alone - they bypass RBAC by
+// definition, and the store does not scope them either.
+func withCallerRestriction(ctx context.Context, scope Scope, resolve CallerRestrictionResolver) Scope {
+	if resolve == nil {
+		return scope
+	}
+	if isLocalAdmin, _ := ctx.Value(schemas.IsLocalAdminContextKey).(bool); isLocalAdmin {
+		return scope
+	}
+	restriction := resolve(ctx)
+	if !restriction.Restricted {
+		return scope
+	}
+	scope.Unrestricted = false
+	scope.Visibility = restriction.Visibility
+	return scope
 }
 
 // ScopeFromContext derives the caller's scope.

@@ -374,3 +374,89 @@ func TestWarpVirtualKeyRankingSaysWhoseKeysItRanks(t *testing.T) {
 	_, present := resultMap(t, out)["guidance"]
 	require.False(t, present)
 }
+
+// A store that scopes per read leaves no queryscope on the context, so the
+// context alone cannot tell a team-scoped user from an admin. The resolver is
+// what does: without it that user's team total was tagged "deployment".
+func TestWarpScopeCallerRestrictionResolver(t *testing.T) {
+	identified := context.WithValue(context.Background(), schemas.BifrostContextKeyUserID, "user-7")
+	restricted := func(context.Context) CallerRestriction {
+		return CallerRestriction{Restricted: true, Visibility: "their teams' traffic"}
+	}
+
+	t.Run("no resolver leaves the context's answer", func(t *testing.T) {
+		scope := withCallerRestriction(identified, ScopeFromContext(identified), nil)
+		require.True(t, scope.Unrestricted)
+		require.Empty(t, scope.Visibility)
+	})
+
+	t.Run("a restricted caller defaults to themselves and is never the deployment", func(t *testing.T) {
+		scope := withCallerRestriction(identified, ScopeFromContext(identified), restricted)
+		require.False(t, scope.Unrestricted)
+		require.Equal(t, "their teams' traffic", scope.Visibility)
+
+		filters := &logstore.SearchFilters{}
+		applyScope(filters, scope, false)
+		require.Equal(t, []string{"user-7"}, filters.UserIDs)
+		require.Equal(t, "self", scopeNote(filters, scope))
+		require.Equal(t, "all", scopeNote(&logstore.SearchFilters{}, scope))
+	})
+
+	t.Run("an unrestricted answer changes nothing", func(t *testing.T) {
+		scope := withCallerRestriction(identified, ScopeFromContext(identified), func(context.Context) CallerRestriction {
+			return CallerRestriction{Visibility: "ignored"}
+		})
+		require.True(t, scope.Unrestricted)
+		require.Empty(t, scope.Visibility)
+	})
+
+	// The resolver only narrows: a scope already on the context is a fact, and
+	// a resolver that knows nothing must not talk Warp out of it.
+	t.Run("never widens a scope the context carries", func(t *testing.T) {
+		scoped := queryscope.WithQueryScope(identified, func(db *gorm.DB) *gorm.DB { return db })
+		scope := withCallerRestriction(scoped, ScopeFromContext(scoped), func(context.Context) CallerRestriction {
+			return CallerRestriction{}
+		})
+		require.False(t, scope.Unrestricted)
+	})
+
+	t.Run("the local admin is not asked", func(t *testing.T) {
+		admin := context.WithValue(identified, schemas.IsLocalAdminContextKey, true)
+		scope := withCallerRestriction(admin, ScopeFromContext(admin), func(context.Context) CallerRestriction {
+			t.Fatal("the local admin bypasses row-level scoping; the resolver must not run")
+			return CallerRestriction{}
+		})
+		require.True(t, scope.Unrestricted)
+	})
+
+	// describe_filter_space is where the model learns what "all" covers.
+	t.Run("describe_filter_space names what the caller may see", func(t *testing.T) {
+		scope := withCallerRestriction(identified, ScopeFromContext(identified), restricted)
+		deps := &ToolDeps{logManager: &fakeLogReader{}, scope: scope}
+		out := resultMap(t, mustRunTool(t, "describe_filter_space", deps, map[string]any{}))
+		require.Equal(t, "the person asking", out["default_scope"])
+		require.Equal(t, "their teams' traffic", out["caller_can_see"])
+
+		unrestricted := &ToolDeps{logManager: &fakeLogReader{}, scope: ScopeFromContext(identified)}
+		out = resultMap(t, mustRunTool(t, "describe_filter_space", unrestricted, map[string]any{}))
+		require.NotContains(t, out, "caller_can_see")
+	})
+}
+
+// The resolver has to be consulted with the context the turn runs under: that
+// snapshot is the only identity the agent's goroutine holds.
+func TestWarpRunTurnAsksTheCallerRestrictionResolver(t *testing.T) {
+	model := &scriptedModel{}
+	service := chatService(model, &fakeLogReader{})
+	var asked []string
+	WithCallerRestrictionResolver(func(ctx context.Context) CallerRestriction {
+		userID, _ := ctx.Value(schemas.BifrostContextKeyUserID).(string)
+		asked = append(asked, userID)
+		return CallerRestriction{Restricted: true}
+	})(service)
+
+	turn, err := service.NewTurn(context.Background(), &ChatRequest{Messages: []ChatMessage{{Role: "user", Content: "hi"}}}, 32)
+	require.NoError(t, err)
+	service.RunTurn(ownerCtx("user-7"), turn, nil)
+	require.Equal(t, []string{"user-7"}, asked)
+}
